@@ -58,7 +58,10 @@ class Connections:
         
         
     async def reply(self, name, data):
-        line = f"{name} {data}"
+        # strip the dummy name provided by the user. this will be better handled
+        # with json when we can next the instruction object inside something
+        # with a name field.
+        line = name + data.split(" ")[1:].join(" ")
         with open(history_for_replay_file, "a+") as history_for_replay:
             history_for_replay.write(f"{line}\n")
 

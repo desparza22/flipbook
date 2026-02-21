@@ -98,6 +98,44 @@ function DrawMouse({mouse_position, rerender_trigger}) {
       </>)
 }
 
+class DrawInstruction {
+  // TODO: use subclasses to express instructions of different types. For now,
+  // if point is null we're signaling mouse up, otherwise we're drawing a new
+  // point.
+  constructor(name, frame_index, point) {
+    this.name = name;
+    this.frame_index = frame_index;
+    this.point = point;    
+  }
+
+  // TODO: json
+  toString() {
+    if (this.point !== null) {
+      return this.name + " point " + this.frame_index + " " + this.point.x + " " + this.point.y;
+    } else {
+      return this.name + " endpath " + this.frame_index;
+    }
+  }
+}
+
+function instructionOfString(str) {
+  const parts = str.split(" ");
+  const name = parts[0];
+  // TODO: parse into int, for now string works
+  const frame_index = parseInt(parts[2]);
+
+  let point = null;
+  if (parts[1] == "point") {
+    point = {x:parseFloat(parts[3]), y:parseFloat(parts[4])};
+  } else {
+    if (parts[1] != "endpath") {
+      console.log("unexpected instruction '" + str + "'");
+    }
+  }
+
+  return new DrawInstruction(name, frame_index, point);
+}
+
 class Paths {
   constructor() {
     this.finishedPaths = [];
@@ -108,32 +146,23 @@ class Paths {
     return this.finishedPaths.concat([...this.openPaths.values()]);
   }
 
-  // returns false, should never cause rerender
-  mouseDown(name, point) {
+  // returns true, should always cause rerender
+  point(name, point) {
     if (!this.openPaths.has(name)) {
       this.openPaths.set(name, [point]);
     } else {
       this.openPaths.get(name).push(point);
     }
-    return false;
+    return true;
   }
 
-  // returns true if paths should be rerendered
-  mouseMove(name, point) {
-    if (this.openPaths.has(name)) {
-      this.openPaths.get(name).push(point);
-      return true;
-    }
-    return false;
-  }
-
-  // returns list if paths should be rerendered
-  mouseUp(name) {
+  endpath(name) {
     if (this.openPaths.has(name)) {
       this.finishedPaths.push(this.openPaths.get(name));
       this.openPaths.delete(name);
       return true;
     }
+    console.log("unexpected end path with no active path? for " + name);
     return false;
   }
 }
@@ -152,19 +181,14 @@ class Frame {
     return this.syncedPaths;
   }
 
-  mouseDown(name, point, local_or_synced) {
+  point(name, point, local_or_synced) {
     const paths = this.getPaths(local_or_synced);
-    return paths.mouseDown(name, point);
+    return paths.point(name, point);
   }
 
-  mouseMove(name, point, local_or_synced) {
+  endpath(name, local_or_synced) {
     const paths = this.getPaths(local_or_synced);
-    return paths.mouseMove(name, point);
-  }
-
-  mouseUp(name, local_or_synced) {
-    const paths = this.getPaths(local_or_synced);
-    return paths.mouseUp(name, local_or_synced);
+    return paths.endpath(name, local_or_synced);
   }
 }
 
@@ -226,21 +250,25 @@ class Frames {
     return frame_index >= this.display_index - 1 && frame_index <= this.display_index + 1
   }
 
-  // TODO only return true if frame_index == display_index (or, if it is within
-  // bound, since we'll also faintly display the previous and next frame)
-  mouseDown(name, point, frame_index, local_or_synced) {
+  _point(name, point, frame_index, local_or_synced) {
     const frame = this.getFrame(frame_index);
-    return frame.mouseDown(name, point, local_or_synced) && this.frameIndexWithinDisplayBounds(frame_index);
+    return frame.point(name, point, local_or_synced) && this.frameIndexWithinDisplayBounds(frame_index);
   }
 
-  mouseMove(name, point, frame_index, local_or_synced) {
+  _endpath(name, frame_index, local_or_synced) {
     const frame = this.getFrame(frame_index);
-    return frame.mouseMove(name, point, local_or_synced) && this.frameIndexWithinDisplayBounds(frame_index);
+    return frame.endpath(name, local_or_synced) && this.frameIndexWithinDisplayBounds(frame_index);
   }
 
-  mouseUp(name, frame_index, local_or_synced) {
-    const frame = this.getFrame(frame_index);
-    return frame.mouseUp(name, local_or_synced) && this.frameIndexWithinDisplayBounds(frame_index);
+  executeInstruction(draw_instruction, local_or_synced) {
+    if (draw_instruction.point == null) {
+      this._endpath(draw_instruction.name, draw_instruction.frame_index, local_or_synced);
+    } else {
+      this._point(draw_instruction.name, 
+        draw_instruction.point, 
+        draw_instruction.frame_index, 
+        local_or_synced);
+    }
   }
 }
 
@@ -268,12 +296,18 @@ export default function App() {
   const syncedPathsIdx = 1;
 
   const frames = useRef(new Frames());
+
+  const mouseBox = useRef(null);
   const mouse_positions = useRef(new Mouse());
 
   const [rerenderDrawingTrigger, setRerenderDrawingTrigger] = useState(0);
   const [rerenderMouseTrigger, setRerenderMouseTrigger] = useState(0);
 
+  const pointerLocked = useRef(false);
+
+
   const [animationRunning, setAnimationRunning] = useState(false);
+
 
   function playPause() {
     setAnimationRunning(animationRunning => !animationRunning);
@@ -302,85 +336,71 @@ export default function App() {
     triggerDrawingRerender();
   }
 
-  function mouseDown(name, frame_index, local_or_synced) {
-    const mouse_position = mouse_positions.current.getPosition(name);
-    if (mouse_position !== null && frames.current.mouseDown(name, mouse_position, frame_index, local_or_synced)) {
-      triggerDrawingRerender();
+  function sendInstruction(draw_instruction) {
+    if (eventSocket.current?.readyState == WebSocket.OPEN) {
+      eventSocket.current?.send(draw_instruction.toString());
     }
   }
+  
+  const onMouseDown = async () => {
+    if (!document.pointerLockElement) {
+      if (mouseBox.current) {
+        await mouseBox.current.requestPointerLock({
+          unadjustedMovement: true,
+        });
+      }
+    }
 
-  function mouseMove(name, point, frame_index, local_or_synced) {
+    const name = "local";
+    const mouse_position = mouse_positions.current.getPosition(name);
+    if (mouse_position !== null) {
+      const draw_instruction = new DrawInstruction(name, frames.current.display_index, mouse_position);
+      if (frames.current.executeInstruction(draw_instruction, localPathsIdx)) {
+        triggerDrawingRerender();
+      }
+      sendInstruction(draw_instruction);
+    }
+  };
+
+  const onMouseMove = (e) => {
+    let point = null;
+    const name = "local";
+    if (pointerLocked.current) {
+      if (mouse_positions.current) {
+        const oldPosition = mouse_positions.current.getPosition(name);
+        if (oldPosition) {
+          point = (oldPosition.x + (e.movementX / 3.)) + " " + (oldPosition.y + (e.movementY / 3.));
+        }
+      }
+    }
+    if (! point) {
+      point = getPoint(e);
+    }
+
     mouse_positions.current.setPosition(name, point);
     triggerMouseRerender();
 
-    if (frames.current.mouseMove(name, point, frame_index, local_or_synced)) {
+    const draw_instruction = new DrawInstruction(name, frames.current.display_index, point);
+    if (frames.current.executeInstruction(draw_instruction, localPathsIdx)) {
       triggerDrawingRerender();
     }
-  }
-
-  function mouseUp(name, frame_index, local_or_synced) {
-    if (frames.current.mouseUp(name, frame_index, local_or_synced)) {
-      triggerDrawingRerender();
-    }
-  }
-
-
-  function getInstructionCoordinates(instruction) {
-    return {x: parseInt(instruction[3]), y: parseInt(instruction[4])}
-  }
-
-  function sendMessage(message) {
-    // TODO: dedup instruction parsing and move sending
-    const instruction = ("local " + message).split(" ");
-    const username = instruction[0];
-    const instructionName = instruction[1];
-    const frame_index = instruction[2]
-    switch (instructionName) {
-      case "mousedown":
-        mouseDown(username, frame_index, localPathsIdx);
-        break;
-      case "mousemove":
-        mouseMove(username, getInstructionCoordinates(instruction), frame_index, localPathsIdx);
-        break;
-      case "mouseup":
-        mouseUp(username, frame_index, localPathsIdx);
-        break;
-      default:
-        console.log("unexpected instruction" + " '" + instruction + "'");
-    }
-
-
-    if (eventSocket.current?.readyState == WebSocket.OPEN) {
-      eventSocket.current?.send(message);
-    }
-  }
-  
-  const onMouseDown = () => {
-    sendMessage("mousedown " + frames.current.display_index);
-  };
-
-  /*
-  use requestPointerLock: https://developer.mozilla.org/en-US/docs/Web/API/Element/requestPointerLock#browser_compatibility
-  to keep mouse locked to center and compute deltas, so we can downscale when the pen is down
-  await canvas.requestPointerLock({
-    unadjustedMovement: true,
-  });
-  */
-  const onMouseMove = (e) => {
-    sendMessage("mousemove " + frames.current.display_index + " " + getPoint(e));
-    // TODO: don't send unnecessary moves to server, represent instructions
-    // differently. currently each front end independently processes mouse
-    // moves, and essentially many get thrown away.
+    sendInstruction(draw_instruction);
   };
 
   const onMouseUp = () => {
-    sendMessage("mouseup " + frames.current.display_index);
+    document.exitPointerLock();
+
+    const draw_instruction = new DrawInstruction("local", frames.current.display_index, null);
+    if (frames.current.executeInstruction(draw_instruction, local_or_synced)) {
+      triggerDrawingRerender();
+    }
+    sendInstruction(draw_instruction);
   };
 
   
-  const onKeyDown = (e) => {
+  const onKeyDown = async (e) => {
     if (e.key == "s") {
-      onMouseDown();
+      await onMouseDown();
     }
   }
 
@@ -396,27 +416,22 @@ export default function App() {
     eventSocket.current = socket;
     
     socket.onmessage = function(event) {
-      const instruction = event.data.split(" ");
-      const username = instruction[0];
-      const instructionName = instruction[1];
-      const frame_index = instruction[2];
-      switch (instructionName) {
-        case "mousedown":
-          mouseDown(username, frame_index, syncedPathsIdx);
-          break;
-        case "mousemove":
-          mouseMove(username, getInstructionCoordinates(instruction), frame_index, syncedPathsIdx);
-          break;
-        case "mouseup":
-          mouseUp(username, frame_index, syncedPathsIdx);
-          break;
-        default:
-          console.log("unexpected instruction" + " '" + instruction + "'");
+      const draw_instruction = instructionOfString(event.data);
+      if (frames.current.executeInstruction(draw_instruction, syncedPathsIdx)) {
+        triggerDrawingRerender();
       }
     }
 
     window.addEventListener("keydown", onKeyDown);
     window.addEventListener("keyup", onKeyUp);
+
+    document.addEventListener("pointerlockchange", () => {
+      if (mouseBox.current && document.pointerLockElement == mouseBox.current) {
+        pointerLocked.current = true;
+      } else {
+        pointerLocked.current = false;
+      }
+    }, false);
 
     return () => {
       window.removeEventListener("keydown", onKeyDown);
@@ -468,7 +483,8 @@ export default function App() {
            onMouseDown={onMouseDown}
            onMouseMove={onMouseMove}
            onMouseUp={onMouseUp}
-           className="Drawing">
+           className="Drawing"
+           ref={mouseBox}>
          </svg>
          <button onClick={clickLeft}> Left </button>
          <button onClick={clickRight}> Right </button>
